@@ -1,0 +1,95 @@
+extends SceneTree
+const Squad = preload("res://scripts/squad_data.gd")
+const Profiles = preload("res://scripts/squad_profiles.gd")
+var failures := 0
+
+func check(condition: bool, message: String) -> void:
+	if not condition:
+		failures += 1
+		push_error(message)
+
+func _initialize() -> void:
+	call_deferred("run_checks")
+
+func run_checks() -> void:
+	var squad := Squad.new()
+	check(squad.suppression_state() == "NORMAL" and squad.effective_movement() == 4, "Zero suppression is NORMAL")
+	squad.apply_suppression()
+	check(squad.suppression_state() == "SUPPRESSED" and squad.effective_movement() == 3 and squad.accuracy_penalty() == 0, "SUPPRESSED reduces movement by one without accuracy loss")
+	check(squad.spend_action("overwatch"), "SUPPRESSED can activate Overwatch")
+	squad.apply_suppression()
+	check(squad.suppression_state() == "PINNED" and squad.effective_movement() == 2 and squad.accuracy_penalty() == 15, "PINNED movement and accuracy penalties")
+	check(not squad.overwatch_active and not squad.can_react() and not squad.can_perform("overwatch") and squad.action_points == 1, "Pinning cancels Overwatch without AP refund")
+	check(not squad.spend_action("overwatch") and squad.action_points == 1, "Pinned activation rejected without spending AP")
+	squad.apply_suppression(100)
+	check(squad.suppression == 2, "Suppression remains capped at two")
+	squad.end_turn()
+	squad.begin_turn()
+	check(squad.is_pinned(), "PINNED persists throughout next own phase")
+	squad.end_turn()
+	check(squad.suppression_state() == "NORMAL" and squad.can_perform("overwatch"), "Own phase recovery restores NORMAL and Overwatch eligibility")
+	squad.spend_action("overwatch")
+	squad.suppression = 2
+	check(not squad.overwatch_active, "Direct state assignment also enforces cancellation")
+	var mg := Profiles.machine_gun_team()
+	mg.apply_suppression()
+	check(mg.is_deployed() and mg.effective_attack_range() == 6, "SUPPRESSED retains stationary bonus")
+	mg.apply_suppression()
+	check(not mg.is_deployed() and mg.deployment_accuracy_bonus() == 0 and mg.effective_attack_range() == 5 and mg.effective_overwatch_range() == 5, "PINNED removes all deployed bonuses")
+	check(mg.effective_movement() == 0, "Pinned MG cannot move")
+	mg.end_turn()
+	mg.begin_turn()
+	check(not mg.is_deployed(), "PINNED still prevents deployment in own phase")
+	mg.end_turn()
+	check(mg.is_deployed() and mg.effective_attack_range() == 6, "Recovery restores stationary bonus")
+	var game = load("res://scenes/battlefield.tscn").instantiate()
+	# Keep this legacy scenario focused on its original Grenadier opponent.
+	game.enemies.erase(game.mg42)
+	game.mission_enabled = false # Isolate tactical rules from mission victory/AI.
+	root.add_child(game)
+	await process_frame
+	game.cover.clear()
+	game.rangers.cell = Vector2i(4, 4)
+	game.enemy.cell = Vector2i(6, 4)
+	game.rangers.face_cell(game.enemy.cell)
+	game.enemy.face_cell(game.rangers.cell)
+	game.enemy.apply_suppression(2)
+	check(game.shot_chance(game.rangers, game.enemy, 85) == 85, "Pinned exposed target gets no defensive bonus")
+	game.cover[Vector2i(6, 3)] = "sandbags"
+	check(game.shot_chance(game.rangers, game.enemy, 85) == 50, "Pinned cover adds ten-point defense to normal cover")
+	check(game.shot_chance(game.rangers, game.enemy, 70) == 35, "Pinned cover applies to reaction-shot accuracy too")
+	game.enemy.face_direction(Vector2.UP)
+	check(game.shot_chance(game.rangers, game.enemy, 85) == 62.5, "Pinned defense stacks with half cover from flank")
+	game.enemy.face_direction(Vector2.RIGHT)
+	check(game.shot_chance(game.rangers, game.enemy, 85) == 75, "Pinned in-cover defense stays separate from rear normal-cover bypass")
+	game.rangers.apply_suppression(2)
+	check(game.shot_chance(game.rangers, game.enemy, 85) == 60, "Attacker pinning accuracy penalty stacks independently")
+	game.rangers.end_turn()
+	game.rangers.begin_turn()
+	game.rangers.end_turn()
+	game.enemy.begin_turn()
+	game.enemy.end_turn()
+	game.enemy.face_cell(game.rangers.cell)
+	check(game.shot_chance(game.rangers, game.enemy, 85) == 60, "Recovery removes pinned defense")
+	game.enemy.apply_suppression()
+	check(game.shot_chance(game.rangers, game.enemy, 85) == 60, "SUPPRESSED grants no extra defense")
+	game.select_squad(game.machine_gun)
+	game.activate_overwatch()
+	game.machine_gun.apply_suppression(2)
+	game.refresh_hud()
+	check(game.overwatch_button.disabled and game.unit_label.text.ends_with("PINNED") and game.attack_state_label.text.contains("PINNED 2/2"), "Panel displays pinned state and numeric detail")
+	check(not await game.try_overwatch(game.machine_gun, game.enemy), "Cancelled Overwatch cannot react")
+	game.select_squad(game.rifle)
+	check(game.machine_gun.is_pinned(), "Switching selection does not recover suppression")
+	game.begin_squad_turn(game.enemy)
+	check(game.machine_gun.is_pinned(), "Enemy phase does not recover Allied suppression")
+	game.enemy.health = 0
+	game.ai_delay_scale = 0.01
+	await game.next_turn()
+	check(game.machine_gun.is_pinned() and not game.machine_gun.is_deployed(), "Next Allied phase retains pinned MG")
+	await game.next_turn()
+	check(game.machine_gun.suppression_state() == "NORMAL" and game.machine_gun.is_deployed(), "Own phase end recovers pinned MG")
+	game.queue_free()
+	await process_frame
+	print("SUPPRESSION STATES CHECKS: ", "PASS" if failures == 0 else "FAIL (%d)" % failures)
+	quit(0 if failures == 0 else 1)

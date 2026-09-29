@@ -1,0 +1,4 @@
+# Publish the self-contained Godot project; keep source packs local.
+/*
+!/.gitignore
+!/juego-maraco/

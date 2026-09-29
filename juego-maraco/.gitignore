@@ -1,0 +1,15 @@
+# Godot 4+ specific ignores
+.godot/
+/android/
+
+# Local test output and generated previews
+*.log
+/demo-preview.png
+/demo-preview.png.import
+/tests/*-portrait.png
+/tests/*-portrait.png.import
+
+# Local secrets
+.env
+.env.*
+!.env.example
