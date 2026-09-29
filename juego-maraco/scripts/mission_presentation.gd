@@ -5,6 +5,7 @@ var intro: Panel
 var deployment: Panel
 var roster: Array[Button] = []
 var begin_button: Button
+var start_button: Button
 var phase_label: Label
 var notice_label: Label
 var phase_time := 0.0
@@ -27,8 +28,11 @@ func setup(battlefield) -> void:
 	game.label_at(intro, "SECURE THE HEDGEROW", Vector2(350, 252), 35)
 	game.label_at(intro, "Capture and hold the German position before Turn 8.", Vector2(350, 321), 18, game.MUTED)
 	game.label_at(intro, "Three Allied squads. Two routes. One position to secure.\n\nDeploy your squads, then end two Allied phases inside the zone.\nGerman troops inside the zone will contest your capture.", Vector2(350, 369), 16, game.MUTED)
-	var start := make_button(intro, "START MISSION", Vector2(350, 498), Vector2(580, 48))
-	start.pressed.connect(game.start_mission)
+	start_button = make_button(intro, "START MISSION", Vector2(350, 498), Vector2(580, 48))
+	start_button.pressed.connect(game.ui_start)
+	var online_button := make_button(intro, "PLAY ONLINE 1v1", Vector2(350, 556), Vector2(580, 40))
+	online_button.pressed.connect(game.open_online_panel)
+	online_button.visible = game.get_node_or_null("/root/OnlineMatch") != null
 	deployment = Panel.new()
 	deployment.position = Vector2(25, 130)
 	deployment.size = Vector2(265, 496)
@@ -38,10 +42,10 @@ func setup(battlefield) -> void:
 	game.label_at(deployment, "Select a squad, then click a\nhighlighted tile to confirm it.\nAll three must be placed.", Vector2(14, 55), 14, game.MUTED)
 	for i in game.allies.size():
 		var button := make_button(deployment, "", Vector2(14, 130 + i * 57), Vector2(237, 48))
-		button.pressed.connect(game.select_squad.bind(game.allies[i]))
+		button.pressed.connect(func(): game.ui_select(game.allies[i]))
 		roster.append(button)
 	begin_button = make_button(deployment, "BEGIN BATTLE", Vector2(14, 323), Vector2(237, 45))
-	begin_button.pressed.connect(game.begin_battle)
+	begin_button.pressed.connect(game.ui_begin)
 	game.label_at(deployment, "Placement costs no AP.\nChoose the west or east approach.\nGerman positions are fixed.", Vector2(14, 389), 13, game.MUTED)
 	phase_label = game.label_at(self, "", Vector2(449, 137), 25, game.GOLD)
 	phase_label.size = Vector2(490, 38)
@@ -85,6 +89,14 @@ func refresh() -> void:
 		roster[i].text = ("✓ " if game.flow.placed.has(squad) else "○ ") + squad.name.trim_prefix("U.S. ")
 		roster[i].modulate = Color.WHITE if squad == game.active_squad else Color("a7b39c")
 	begin_button.disabled = not game.flow.ready(game.allies)
+	var waiting: bool = game.online and game.local_side != game.ALLIED
+	start_button.disabled = waiting
+	start_button.text = "WAITING FOR THE ALLIED PLAYER…" if waiting else "START MISSION"
+	if waiting:
+		begin_button.disabled = true
+		for button in roster: button.disabled = true
+	else:
+		for button in roster: button.disabled = false
 	if game.flow.stage != "BATTLE" or not game.mission_enabled:
 		return
 	if game.mission.capture_points > last_capture:

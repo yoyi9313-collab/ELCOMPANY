@@ -140,6 +140,19 @@ var grenade_status_label: Label
 var grenade_help_label: Label
 var deployment_label: Label
 const WATCH_COLOR := Color("91c8db")
+# Online 1v1 is lockstep: both peers replay the same ordered command list
+# against the same RNG seed, so only player intent crosses the network.
+const ALLIED := "ALLIED"
+const GERMAN := "GERMAN"
+var online := false
+var local_side := ALLIED
+var phase_side := ALLIED
+var net_send: Callable
+var command_queue: Array = []
+var executing_command := false
+var desync := false
+var net_label: Label
+var online_panel: CanvasLayer
 
 func _ready() -> void:
 	feedback = CombatFeedback.new()
@@ -185,6 +198,17 @@ func _ready() -> void:
 		squad.tactical_stats_changed.connect(rebuild_range)
 	rebuild_range()
 	refresh_hud()
+	var net := get_node_or_null("/root/OnlineMatch")
+	if net != null:
+		online_panel = preload("res://scripts/net/online_panel.gd").new()
+		add_child(online_panel)
+		online_panel.setup(self, net)
+		net.match_started.connect(func(side: String, rng_seed: int) -> void: start_online(side, rng_seed, net.send_command))
+		net.command_received.connect(receive_command)
+		net.opponent_left.connect(func() -> void:
+			if online:
+				status = "Opponent disconnected. Match paused."
+				refresh_hud())
 	if "--capture-demo" in OS.get_cmdline_user_args():
 		selected = true
 		set_process(false)
@@ -327,14 +351,25 @@ func all_squads() -> Array[SquadData]:
 func living_enemies() -> Array[SquadData]:
 	return enemies.filter(func(squad: SquadData) -> bool: return squad.health > 0)
 
+func controlled_squads() -> Array[SquadData]:
+	return enemies if phase_side == GERMAN else allies
+
+func opposing_squads() -> Array[SquadData]:
+	return allies if phase_side == GERMAN else enemies
+
+func is_local_turn() -> bool:
+	return not online or phase_side == local_side
+
 func hostile_at(point: Vector2) -> SquadData:
-	for squad in living_enemies():
+	for squad in opposing_squads():
+		if squad.health <= 0:
+			continue
 		if cell_at(point) == squad.cell or squad.hit_test(point):
 			return squad
 	return null
 
 func target_hostile(squad: SquadData, pin: bool = false) -> void:
-	if squad not in enemies or squad.health <= 0:
+	if squad not in opposing_squads() or squad.health <= 0:
 		return
 	target_enemy = squad
 	target_pinned = selected and pin
@@ -372,7 +407,9 @@ func occupied_by_other(cell: Vector2i, mover: SquadData) -> bool:
 	return false
 
 func friendly_at(point: Vector2) -> SquadData:
-	for squad in living_allies():
+	for squad in controlled_squads():
+		if squad.health <= 0:
+			continue
 		if cell_at(point) == squad.cell or squad.hit_test(point):
 			return squad
 	return null
@@ -380,7 +417,7 @@ func friendly_at(point: Vector2) -> SquadData:
 func select_squad(squad: SquadData) -> void:
 	if mission_over() or flow.stage == MissionFlow.INTRO:
 		return
-	if squad not in allies or squad.health <= 0 or enemy_turn or moving or grenade_busy or volley_left > 0.0:
+	if squad not in controlled_squads() or squad.health <= 0 or enemy_turn or moving or grenade_busy or volley_left > 0.0:
 		return
 	active_squad = squad
 	feedback.cue("ui")
@@ -465,6 +502,8 @@ func path_to(destination: Vector2i) -> Array[Vector2i]:
 	return result
 
 func _process(delta: float) -> void:
+	if online and not executing_command and not command_queue.is_empty() and sim_idle():
+		_pump_commands()
 	check_mission()
 	elapsed += delta
 	if grenade_busy:
@@ -489,6 +528,8 @@ func _process(delta: float) -> void:
 	var mouse := ui_mouse - feedback.camera_offset
 	var over_panel := target_panel.visible and target_panel.get_global_rect().has_point(ui_mouse)
 	var hovered_enemy := hostile_at(mouse)
+	if not is_local_turn():
+		hovered_enemy = null
 	if hovered_enemy != null and not enemy_turn and not grenade_mode:
 		target_enemy = hovered_enemy
 	target_hovered = hovered_enemy != null or (over_panel and target_enemy.health > 0)
@@ -496,7 +537,7 @@ func _process(delta: float) -> void:
 	if new_hover != hovered and not moving:
 		hovered = new_hover
 		preview.clear()
-		if selected:
+		if selected and is_local_turn():
 			preview = path_to(hovered)
 	if target_hovered:
 		preview.clear()
@@ -510,9 +551,9 @@ func _unhandled_input(event: InputEvent) -> void:
 			var point: Vector2 = get_canvas_transform().affine_inverse() * event.position
 			var friendly := friendly_at(point)
 			if friendly != null and friendly != active_squad:
-				select_squad(friendly)
+				ui_select(friendly)
 			else:
-				place_deployment(active_squad, cell_at(point))
+				ui_deploy(active_squad, cell_at(point))
 		return
 	if event is InputEventKey and event.pressed and not event.echo and event.keycode == KEY_F3:
 		show_los_debug = not show_los_debug
@@ -520,17 +561,17 @@ func _unhandled_input(event: InputEvent) -> void:
 		return
 	if mission_over():
 		if event is InputEventKey and event.pressed and not event.echo and event.keycode == KEY_R:
-			reset_demo()
+			ui_reset()
 		return
-	if enemy_turn or grenade_busy:
+	if enemy_turn or grenade_busy or not is_local_turn():
 		return
 	if event is InputEventKey and event.pressed and not event.echo:
 		match event.keycode:
-			KEY_SPACE: next_turn()
-			KEY_R: reset_demo()
+			KEY_SPACE: ui_end_turn()
+			KEY_R: ui_reset()
 			KEY_ESCAPE: deselect()
-			KEY_Q: rotate_selected(-45.0)
-			KEY_E: rotate_selected(45.0)
+			KEY_Q: ui_rotate(-45.0)
+			KEY_E: ui_rotate(45.0)
 	if event is InputEventMouseButton and event.pressed and not moving and volley_left <= 0.0:
 		if event.button_index == MOUSE_BUTTON_RIGHT:
 			if grenade_mode:
@@ -538,14 +579,14 @@ func _unhandled_input(event: InputEvent) -> void:
 				return
 			var aim_cell := cell_at(get_canvas_transform().affine_inverse() * event.position - feedback.camera_offset)
 			if selected and inside(aim_cell) and aim_cell != squad_cell:
-				face_selected(aim_cell)
+				ui_face(aim_cell)
 			else:
 				deselect()
 		elif event.button_index == MOUSE_BUTTON_LEFT:
 			var point: Vector2 = get_canvas_transform().affine_inverse() * event.position - feedback.camera_offset
 			var cell := cell_at(point)
 			if grenade_mode:
-				throw_grenade(cell)
+				ui_throw(cell)
 				return
 			if hostile_at(point) != null:
 				target_hostile(hostile_at(point), true)
@@ -553,12 +594,12 @@ func _unhandled_input(event: InputEvent) -> void:
 				refresh_hud()
 				return
 			if friendly_at(point) != null:
-				select_squad(friendly_at(point))
+				ui_select(friendly_at(point))
 			elif selected and inside(cell):
 				if Terrain.blocks_movement(cover.get(cell)):
 					status = "Occupied by cover. Choose a clear tile."
 				elif reachable.has(cell):
-					move_to(cell)
+					ui_move(cell)
 				else:
 					status = "NO AP — start the next turn." if active_squad.action_points == 0 else "Outside this move's range. Choose a highlighted tile."
 				refresh_hud()
@@ -623,7 +664,7 @@ func move_to(destination: Vector2i) -> void:
 		mover.cell = cell
 		feedback.cue("move")
 		steps_moved += 1
-		for watcher in living_enemies():
+		for watcher in opposing_squads():
 			if mover.health <= 0:
 				break
 			await try_overwatch(watcher, mover)
@@ -640,6 +681,9 @@ func next_turn() -> void:
 		return
 	grenade_mode = false
 	if moving or enemy_turn or volley_left > 0.0 or living_allies().is_empty():
+		return
+	if online:
+		end_online_phase()
 		return
 	for squad in allies:
 		squad.end_turn()
@@ -679,6 +723,41 @@ func next_turn() -> void:
 	if selected:
 		preview = path_to(hovered)
 	status = "Allied squads eliminated. Reset to play again." if living_allies().is_empty() else "ALLIED TURN — each surviving squad has 2 AP."
+	refresh_hud()
+
+## Online replacement for the AI phase: the opposing player takes the turn.
+func end_online_phase() -> void:
+	var finishing := controlled_squads()
+	for squad in finishing:
+		squad.end_turn()
+	if phase_side == ALLIED:
+		mission.end_allied_phase(turn_number, allies, enemies)
+	else:
+		mission.end_german_phase(turn_number, allies, enemies)
+	if mission_over():
+		refresh_hud()
+		return
+	if phase_side == GERMAN:
+		turn_number += 1
+	phase_side = GERMAN if phase_side == ALLIED else ALLIED
+	presentation.announce_phase(phase_side)
+	for squad in controlled_squads():
+		if squad.health > 0:
+			begin_squad_turn(squad)
+	selected = false
+	target_pinned = false
+	suppression_text_left = 0.0
+	preview.clear()
+	for squad in controlled_squads():
+		if squad.health > 0:
+			active_squad = squad
+			break
+	for squad in opposing_squads():
+		if squad.health > 0:
+			target_enemy = squad
+			break
+	rebuild_range()
+	status = ("YOUR TURN — " if is_local_turn() else "OPPONENT'S TURN — ") + "%s squads have 2 AP." % phase_side
 	refresh_hud()
 
 func run_enemy_turn(attacker: SquadData) -> void:
@@ -790,10 +869,181 @@ func reset_demo() -> void:
 	enemy.face_cell(active_squad.cell)
 	flank_text = ""
 	selected = false
+	phase_side = ALLIED
 	preview.clear()
 	rebuild_range()
 	status = "Select your squad to inspect movement range."
 	refresh_hud()
+
+# --- Online 1v1 command layer -------------------------------------------------
+# Local input calls ui_*; offline those run immediately, online they become
+# commands queued on both peers and executed in the same order when idle.
+
+func start_online(side: String, rng_seed: int, send: Callable) -> void:
+	online = true
+	local_side = side
+	net_send = send
+	command_queue.clear()
+	executing_command = false
+	desync = false
+	moving = false
+	enemy_turn = false
+	enemy_moving = false
+	grenade_busy = false
+	combat_rng.seed = rng_seed
+	reset_demo()
+	status = "ONLINE — you command the %s. " % ("Allies" if side == ALLIED else "Germans") + ("Press START MISSION." if side == ALLIED else "Waiting for the Allied player to deploy.")
+	refresh_hud()
+
+func open_online_panel() -> void:
+	if online_panel != null:
+		online_panel.visible = true
+		online_panel.refresh()
+
+func stop_online() -> void:
+	online = false
+	command_queue.clear()
+	phase_side = ALLIED
+	reset_demo()
+
+func receive_command(command: Array) -> void:
+	if online:
+		command_queue.append(command)
+
+func sim_idle() -> bool:
+	return not moving and not enemy_turn and not enemy_moving and not grenade_busy and volley_left <= 0.0 and not executing_command
+
+func can_issue(action: String) -> bool:
+	if not online or not sim_idle() or not command_queue.is_empty():
+		return false
+	if action == "reset":
+		return local_side == ALLIED and mission_over()
+	return is_local_turn()
+
+func request(command: Array) -> void:
+	if not can_issue(command[0]):
+		return
+	command.append(state_hash())
+	if net_send.is_valid():
+		net_send.call(command)
+	command_queue.append(command)
+
+func squad_id(squad: SquadData) -> int:
+	return all_squads().find(squad)
+
+func squad_by_id(id: int) -> SquadData:
+	var squads := all_squads()
+	return squads[id] if id >= 0 and id < squads.size() else null
+
+## Every peer hashes the same fields before executing a command; the sender's
+## hash travels with it, so any divergence is reported immediately.
+func state_hash() -> int:
+	var fields: Array = [turn_number, phase_side, flow.stage, combat_rng.state, mission.capture_points, mission.winner]
+	for squad in all_squads():
+		fields.append_array([squad.cell, squad.health, squad.action_points, squad.suppression, squad.facing, squad.attacks_this_turn, squad.overwatch_active, squad.grenades_remaining])
+	return hash(fields)
+
+func _pump_commands() -> void:
+	executing_command = true
+	var command: Array = command_queue.pop_front()
+	var expected: int = command.pop_back()
+	if expected != state_hash() and not desync:
+		desync = true
+		push_warning("Online desync before command %s" % [command])
+	await execute_command(command)
+	executing_command = false
+
+func act_as(id: int) -> SquadData:
+	var squad := squad_by_id(id)
+	if squad != null:
+		select_squad(squad)
+	return squad
+
+func execute_command(command: Array) -> void:
+	match command[0]:
+		"start": start_mission()
+		"deploy":
+			act_as(command[1])
+			place_deployment(squad_by_id(command[1]), command[2])
+		"begin": begin_battle()
+		"select": act_as(command[1])
+		"move":
+			act_as(command[1])
+			rebuild_range()
+			await move_to(command[2])
+		"fire":
+			act_as(command[1])
+			target_enemy = squad_by_id(command[2])
+			attack_enemy()
+		"overwatch":
+			act_as(command[1])
+			activate_overwatch()
+		"face":
+			act_as(command[1])
+			if can_rotate():
+				active_squad.face_direction(command[2])
+				queue_redraw()
+		"grenade":
+			act_as(command[1])
+			grenade_mode = true
+			await throw_grenade(command[2])
+		"end_turn": await next_turn()
+		"reset": reset_demo()
+	refresh_hud()
+
+func ui_start() -> void:
+	if online: request(["start"])
+	else: start_mission()
+
+func ui_begin() -> void:
+	if online: request(["begin"])
+	else: begin_battle()
+
+func ui_select(squad: SquadData) -> void:
+	if online: request(["select", squad_id(squad)])
+	else: select_squad(squad)
+
+func ui_deploy(squad: SquadData, cell: Vector2i) -> void:
+	if online: request(["deploy", squad_id(squad), cell])
+	else: place_deployment(squad, cell)
+
+func ui_move(cell: Vector2i) -> void:
+	if online: request(["move", squad_id(active_squad), cell])
+	else: move_to(cell)
+
+func ui_fire() -> void:
+	if online:
+		if attack_block_reason().is_empty():
+			request(["fire", squad_id(active_squad), squad_id(target_enemy)])
+	else: attack_enemy()
+
+func ui_overwatch() -> void:
+	if online: request(["overwatch", squad_id(active_squad)])
+	else: activate_overwatch()
+
+func ui_rotate(degrees: float) -> void:
+	if online:
+		if can_rotate(): request(["face", squad_id(active_squad), active_squad.facing.rotated(deg_to_rad(degrees))])
+	else: rotate_selected(degrees)
+
+func ui_face(cell: Vector2i) -> void:
+	if online:
+		if can_rotate(): request(["face", squad_id(active_squad), Vector2(cell - active_squad.cell)])
+	else: face_selected(cell)
+
+func ui_throw(cell: Vector2i) -> void:
+	if online:
+		if valid_grenade_tile(cell): request(["grenade", squad_id(active_squad), cell])
+		else: throw_grenade(cell)
+	else: throw_grenade(cell)
+
+func ui_end_turn() -> void:
+	if online: request(["end_turn"])
+	else: next_turn()
+
+func ui_reset() -> void:
+	if online: request(["reset"])
+	else: reset_demo()
 
 func grid_name(cell: Vector2i) -> String:
 	return "%s%d" % [char(65 + cell.x), cell.y + 1]
@@ -1135,6 +1385,7 @@ func build_hud() -> void:
 	phase_label = label_at(layer, "ALLIED PHASE", Vector2(1081, 63), 12, MUTED)
 	objective_label = label_at(layer, "", Vector2(620, 22), 14, GOLD)
 	reaction_label = label_at(layer, "OVERWATCH FIRE", Vector2(620, 92), 16, WATCH_COLOR)
+	net_label = label_at(layer, "", Vector2(620, 112), 14, WATCH_COLOR)
 	label_at(layer, "01  /  RECON SECTOR", Vector2(39, 146), 15, GOLD)
 	label_at(layer, "Hold the central zone.\nEnd two Allied phases there.\nKeep German squads out.", Vector2(39, 176), 15, MUTED)
 	overwatch_button = Button.new()
@@ -1145,7 +1396,7 @@ func build_hud() -> void:
 	overwatch_button.add_theme_stylebox_override("normal", button_style(Color("29414a")))
 	overwatch_button.add_theme_stylebox_override("hover", button_style(Color("3c5964")))
 	overwatch_button.add_theme_stylebox_override("focus", button_style(Color("3c5964")))
-	overwatch_button.pressed.connect(activate_overwatch)
+	overwatch_button.pressed.connect(ui_overwatch)
 	overwatch_button.mouse_entered.connect(func(): overwatch_preview = true)
 	overwatch_button.mouse_exited.connect(func(): overwatch_preview = false)
 	overwatch_button.focus_entered.connect(func(): overwatch_preview = true)
@@ -1157,14 +1408,14 @@ func build_hud() -> void:
 	rotate_left_button.position = Vector2(39, 364)
 	rotate_left_button.size = Vector2(99, 31)
 	rotate_left_button.focus_mode = Control.FOCUS_NONE
-	rotate_left_button.pressed.connect(rotate_selected.bind(-45.0))
+	rotate_left_button.pressed.connect(ui_rotate.bind(-45.0))
 	layer.add_child(rotate_left_button)
 	rotate_right_button = Button.new()
 	rotate_right_button.text = "RIGHT   E"
 	rotate_right_button.position = Vector2(145, 364)
 	rotate_right_button.size = Vector2(104, 31)
 	rotate_right_button.focus_mode = Control.FOCUS_NONE
-	rotate_right_button.pressed.connect(rotate_selected.bind(45.0))
+	rotate_right_button.pressed.connect(ui_rotate.bind(45.0))
 	layer.add_child(rotate_right_button)
 	for button in [rotate_left_button, rotate_right_button]:
 		button.add_theme_stylebox_override("normal", button_style(Color("293b35")))
@@ -1206,7 +1457,7 @@ func build_hud() -> void:
 	fire_button.focus_mode = Control.FOCUS_NONE
 	fire_button.add_theme_stylebox_override("normal", button_style(Color("634b37")))
 	fire_button.add_theme_stylebox_override("hover", button_style(Color("826440")))
-	fire_button.pressed.connect(attack_enemy)
+	fire_button.pressed.connect(ui_fire)
 	target_panel.add_child(fire_button)
 	label_at(target_panel, "Max 1 attack / turn · costs 1 AP", Vector2(12, 252), 11, MUTED)
 	unit_name_label = label_at(layer, "U.S. RANGERS", Vector2(42, 680), 20)
@@ -1227,7 +1478,7 @@ func build_hud() -> void:
 	end_button.add_theme_stylebox_override("pressed", button_style(Color("293525")))
 	end_button.add_theme_color_override("font_color", INK)
 	end_button.focus_mode = Control.FOCUS_NONE
-	end_button.pressed.connect(next_turn)
+	end_button.pressed.connect(ui_end_turn)
 	layer.add_child(end_button)
 	reset_button = Button.new()
 	reset_button.text = "RESET EXERCISE  [R]"
@@ -1236,7 +1487,7 @@ func build_hud() -> void:
 	reset_button.flat = true
 	reset_button.focus_mode = Control.FOCUS_NONE
 	reset_button.add_theme_color_override("font_color", MUTED)
-	reset_button.pressed.connect(reset_demo)
+	reset_button.pressed.connect(ui_reset)
 	layer.add_child(reset_button)
 	label_at(layer, "LEFT CLICK  Select / move    •    Q/E  Rotate    •    RIGHT CLICK  Face tile    •    ESC  Deselect    •    F3  LOS debug", Vector2(39, 774), 12, MUTED)
 	var outcome_layer := CanvasLayer.new()
@@ -1258,7 +1509,7 @@ func build_hud() -> void:
 	restart_button.position = Vector2(30, 388)
 	restart_button.size = Vector2(540, 42)
 	restart_button.text = "RESTART MISSION [R]"
-	restart_button.pressed.connect(reset_demo)
+	restart_button.pressed.connect(ui_reset)
 	outcome_panel.add_child(restart_button)
 
 func refresh_hud() -> void:
@@ -1360,7 +1611,39 @@ func refresh_hud() -> void:
 		fire_button.disabled = true
 		overwatch_button.disabled = true
 		grenade_button.disabled = true
+	refresh_online_hud()
 	if presentation != null: presentation.refresh()
+
+func refresh_online_hud() -> void:
+	net_label.visible = online
+	if not online:
+		return
+	var you := "ALLIES" if local_side == ALLIED else "GERMANS"
+	net_label.text = "ONLINE 1v1 · YOU: %s · %s" % [you, "YOUR TURN" if is_local_turn() else "OPPONENT'S TURN"]
+	if local_side == GERMAN:
+		net_label.text += "
+DENY THE ZONE UNTIL TURN 8 ENDS"
+	net_label.remove_theme_color_override("font_color")
+	net_label.add_theme_color_override("font_color", WATCH_COLOR)
+	if desync:
+		net_label.text += "
+⚠ DESYNC DETECTED — restart the match"
+		net_label.add_theme_color_override("font_color", ENEMY_COLOR)
+	if flow.stage == MissionFlow.BATTLE and not mission_over():
+		phase_label.text = "%s PHASE · %s" % [phase_side, "YOU" if is_local_turn() else "OPPONENT"]
+	if mission_over():
+		var won := mission.winner == local_side
+		outcome_title.text = ("VICTORY" if won else "DEFEAT") + " — " + ("ALLIES" if mission.winner == ALLIED else "GERMANS") + " WIN"
+		outcome_title.add_theme_color_override("font_color", GREEN if won else ENEMY_COLOR)
+		restart_button.text = "REMATCH [R]" if local_side == ALLIED else "WAITING FOR HOST TO REMATCH"
+		restart_button.disabled = restart_button.disabled or local_side != ALLIED
+		reset_button.disabled = restart_button.disabled
+	else:
+		reset_button.disabled = true
+	if not is_local_turn():
+		target_panel.visible = false
+		for button in [end_button, fire_button, overwatch_button, grenade_button, rotate_left_button, rotate_right_button]:
+			button.disabled = true
 
 func diamond(center: Vector2, inset: float = 0.0) -> PackedVector2Array:
 	return PackedVector2Array([center + Vector2(0, -HALF.y + inset), center + Vector2(HALF.x - inset, 0), center + Vector2(0, HALF.y - inset), center + Vector2(-HALF.x + inset, 0)])
