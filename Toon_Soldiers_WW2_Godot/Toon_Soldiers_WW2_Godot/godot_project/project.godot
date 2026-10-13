@@ -1,0 +1,7 @@
+config_version=5
+
+[application]
+config/name="Toon Soldiers WW2 - Godot"
+
+[rendering]
+renderer/rendering_method="gl_compatibility"

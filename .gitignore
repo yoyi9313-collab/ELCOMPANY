@@ -1,4 +1,22 @@
-# Publish the self-contained Godot project; keep source packs local.
+# Game and original source assets backed up before reinstalling Windows.
 /*
 !/.gitignore
 !/juego-maraco/
+!/RESPALDO.md
+!/americano/
+!/Basic Shooter Pack/
+!/KAR98/
+!/NAZI/
+!/Toon_Soldiers_WW2_Godot/
+!/americano.zip
+!/Basic Shooter Pack.zip
+!/KAR98.zip
+!/NAZI.zip
+!/Toon_Soldiers_WW2_Godot.rar
+
+# Regenerable editor files and local secrets are not backup material.
+.godot/
+*.log
+.env
+.env.*
+!.env.example

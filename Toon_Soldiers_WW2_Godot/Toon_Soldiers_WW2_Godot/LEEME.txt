@@ -1,0 +1,19 @@
+TOON SOLDIERS WW2 DEMO - PREPARADO PARA GODOT
+
+ARCHIVO PARA USAR: soldado_ww2.glb
+Copia ese archivo dentro de tu proyecto Godot y arrastralo a una escena 3D.
+Incluye el soldado estadounidense con Garand, textura integrada y esqueleto.
+En AnimationPlayer encontraras: combat_idle, combat_run, combat_shoot y guard_idle.
+No incluye controlador, colisiones ni logica de disparo.
+
+Validado con Godot 4.7: carga del GLB, textura integrada, 20 huesos exportados y reproduccion de las cuatro animaciones sin errores. No se ha realizado revision visual de la animacion.
+
+godot_project/: proyecto utilizado para preparar y verificar los recursos; contiene los FBX y la textura originales, ademas de scripts de conversion.
+original_unity/: paquete original y contenido extraido, incluida documentacion del autor.
+El FBX original referencia un PSD ausente. El GLB utiliza la textura TGA incluida y no depende de esa ruta rota.
+
+Autor: Polygon Blacksmith.
+Fuente: https://assetstore.unity.com/packages/3d/characters/humanoids/toon-soldiers-ww2-demo-85702
+Licencia original: Standard Unity Asset Store EULA. La conversion no cambia la licencia.
+https://unity.com/legal/as-terms
+
